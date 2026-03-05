@@ -57,7 +57,6 @@ private:
 
     // Device memory — all positions and fitness use double
     double*      d_positions_;
-    double*      d_positions_old_;   // Jacobi snapshot: read-only during update kernel
     double*      d_fitness_;
     int*         d_bestNeighborIdx_;
     curandState* d_rngStates_;
@@ -102,7 +101,6 @@ private:
 inline DFOOptimizer::DFOOptimizer(const DFOConfig& config)
     : config_(config),
       d_positions_(nullptr),
-      d_positions_old_(nullptr),
       d_fitness_(nullptr),
       d_bestNeighborIdx_(nullptr),
       d_rngStates_(nullptr),
@@ -140,7 +138,6 @@ inline void DFOOptimizer::allocateMemory() {
     int numPartials = (N + DFO_BLOCK_SIZE - 1) / DFO_BLOCK_SIZE;
 
     CUDA_CHECK(cudaMalloc(&d_positions_,         (size_t)N * D * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_positions_old_,     (size_t)N * D * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_fitness_,           (size_t)N     * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_bestNeighborIdx_,   (size_t)N     * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_rngStates_,         (size_t)N * D * sizeof(curandState)));
@@ -158,7 +155,6 @@ inline void DFOOptimizer::allocateMemory() {
 
 inline void DFOOptimizer::freeMemory() {
     if (d_positions_)            cudaFree(d_positions_);
-    if (d_positions_old_)        cudaFree(d_positions_old_);
     if (d_fitness_)              cudaFree(d_fitness_);
     if (d_bestNeighborIdx_)      cudaFree(d_bestNeighborIdx_);
     if (d_rngStates_)            cudaFree(d_rngStates_);
