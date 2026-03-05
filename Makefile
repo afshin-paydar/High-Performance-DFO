@@ -17,7 +17,7 @@ CUDA_ARCH ?= $(shell python3 -c "import subprocess,re; out=subprocess.run(['nvid
 # Compiler flags
 NVCC_FLAGS = -O3 -arch=$(CUDA_ARCH) -std=c++17
 NVCC_FLAGS += -Xcompiler -Wall -Xcompiler -Wextra
-NVCC_FLAGS += --use_fast_math
+NVCC_FLAGS += --ftz=false  # Keep IEEE 754 denormal behavior (double precision correctness)
 NVCC_FLAGS += -lineinfo  # For profiling
 
 # Debug flags (use: make DEBUG=1)

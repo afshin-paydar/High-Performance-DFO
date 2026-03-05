@@ -57,6 +57,7 @@ private:
 
     // Device memory — all positions and fitness use double
     double*      d_positions_;
+    double*      d_positions_old_;   // Jacobi snapshot: read-only during update kernel
     double*      d_fitness_;
     int*         d_bestNeighborIdx_;
     curandState* d_rngStates_;
@@ -65,6 +66,10 @@ private:
     // Device scalars
     int*    d_globalBestIdx_;
     double* d_globalBestFitness_;
+
+    // Two-phase global-best reduction temporaries (phase 1 output, phase 2 input)
+    double* d_partialBestFitness_;
+    int*    d_partialBestIdx_;
 
     // Debug stats buffer on device (8 doubles, see kernelComputeDebugStats)
     double* d_debugStats_;
@@ -97,12 +102,15 @@ private:
 inline DFOOptimizer::DFOOptimizer(const DFOConfig& config)
     : config_(config),
       d_positions_(nullptr),
+      d_positions_old_(nullptr),
       d_fitness_(nullptr),
       d_bestNeighborIdx_(nullptr),
       d_rngStates_(nullptr),
       d_bestPosition_(nullptr),
       d_globalBestIdx_(nullptr),
       d_globalBestFitness_(nullptr),
+      d_partialBestFitness_(nullptr),
+      d_partialBestIdx_(nullptr),
       d_debugStats_(nullptr),
       h_globalBestIdx_(0),
       h_globalBestFitness_(DBL_MAX),
@@ -128,13 +136,19 @@ inline void DFOOptimizer::allocateMemory() {
     int N = config_.populationSize;
     int D = config_.dimensions;
 
+    // Number of phase-1 partial results for global-best search
+    int numPartials = (N + DFO_BLOCK_SIZE - 1) / DFO_BLOCK_SIZE;
+
     CUDA_CHECK(cudaMalloc(&d_positions_,         (size_t)N * D * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_positions_old_,     (size_t)N * D * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_fitness_,           (size_t)N     * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_bestNeighborIdx_,   (size_t)N     * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_rngStates_,         (size_t)N * D * sizeof(curandState)));
     CUDA_CHECK(cudaMalloc(&d_bestPosition_,      (size_t)D     * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_globalBestIdx_,                     sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_globalBestFitness_,                 sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_partialBestFitness_, numPartials  * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_partialBestIdx_,     numPartials  * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_debugStats_,        8             * sizeof(double)));
 
     CUDA_CHECK(cudaMemcpyToSymbol(d_N,     &N,             sizeof(int)));
@@ -143,14 +157,17 @@ inline void DFOOptimizer::allocateMemory() {
 }
 
 inline void DFOOptimizer::freeMemory() {
-    if (d_positions_)         cudaFree(d_positions_);
-    if (d_fitness_)           cudaFree(d_fitness_);
-    if (d_bestNeighborIdx_)   cudaFree(d_bestNeighborIdx_);
-    if (d_rngStates_)         cudaFree(d_rngStates_);
-    if (d_bestPosition_)      cudaFree(d_bestPosition_);
-    if (d_globalBestIdx_)     cudaFree(d_globalBestIdx_);
-    if (d_globalBestFitness_) cudaFree(d_globalBestFitness_);
-    if (d_debugStats_)        cudaFree(d_debugStats_);
+    if (d_positions_)            cudaFree(d_positions_);
+    if (d_positions_old_)        cudaFree(d_positions_old_);
+    if (d_fitness_)              cudaFree(d_fitness_);
+    if (d_bestNeighborIdx_)      cudaFree(d_bestNeighborIdx_);
+    if (d_rngStates_)            cudaFree(d_rngStates_);
+    if (d_bestPosition_)         cudaFree(d_bestPosition_);
+    if (d_globalBestIdx_)        cudaFree(d_globalBestIdx_);
+    if (d_globalBestFitness_)    cudaFree(d_globalBestFitness_);
+    if (d_partialBestFitness_)   cudaFree(d_partialBestFitness_);
+    if (d_partialBestIdx_)       cudaFree(d_partialBestIdx_);
+    if (d_debugStats_)           cudaFree(d_debugStats_);
 }
 
 inline void DFOOptimizer::setBounds(const double* lower, const double* upper) {
@@ -220,28 +237,27 @@ inline void DFOOptimizer::evaluateFitness(FitnessFunction fitnessType) {
 
 inline void DFOOptimizer::findGlobalBest() {
     int N = config_.populationSize;
-
-    // Single block; size = smallest power-of-2 >= N, capped at 1024
-    int blockSize = 64;
-    while (blockSize < N && blockSize < 1024) blockSize <<= 1;
-
-    // Shared memory: blockSize doubles (values) + blockSize ints (indices)
-    // Pad int array to start at a double-aligned offset
-    size_t sharedMem = (size_t)blockSize * sizeof(double)
-                     + (size_t)blockSize * sizeof(int);
-
     bool minimize = (config_.optType == OptimizationType::MINIMIZE);
 
-    // Initialise device scalar before kernel so the warp reduction has a
-    // defined sentinel to overwrite.
-    double initFitness = minimize ? DBL_MAX : -DBL_MAX;
-    CUDA_CHECK(cudaMemcpyAsync(d_globalBestFitness_, &initFitness, sizeof(double),
-                               cudaMemcpyHostToDevice, computeStream_));
+    // ---- Phase 1: each block of DFO_BLOCK_SIZE particles → one partial result ----
+    int numPartials = (N + DFO_BLOCK_SIZE - 1) / DFO_BLOCK_SIZE;
+    size_t sharedMem1 = (size_t)DFO_BLOCK_SIZE * (sizeof(double) + sizeof(int));
 
-    kernelFindGlobalBest<<<1, blockSize, sharedMem, computeStream_>>>(
-        d_fitness_, d_globalBestIdx_, d_globalBestFitness_, N, minimize);
+    kernelReduceToBlockBest<<<numPartials, DFO_BLOCK_SIZE, sharedMem1, computeStream_>>>(
+        d_fitness_, d_partialBestFitness_, d_partialBestIdx_, N, minimize);
 
-    // Cross-stream ordering: copyStream_ must wait for the kernel
+    // ---- Phase 2: single block reduces the partial results ----
+    // blockSize = next power-of-2 >= numPartials, minimum 64
+    int blockSize2 = 64;
+    while (blockSize2 < numPartials && blockSize2 < 1024) blockSize2 <<= 1;
+    size_t sharedMem2 = (size_t)blockSize2 * (sizeof(double) + sizeof(int));
+
+    kernelReduceFinalBest<<<1, blockSize2, sharedMem2, computeStream_>>>(
+        d_partialBestFitness_, d_partialBestIdx_,
+        d_globalBestIdx_, d_globalBestFitness_,
+        numPartials, minimize);
+
+    // Cross-stream ordering: copyStream_ must wait for the kernels
     cudaEvent_t ev;
     CUDA_CHECK(cudaEventCreate(&ev));
     CUDA_CHECK(cudaEventRecord(ev, computeStream_));
@@ -271,17 +287,24 @@ inline void DFOOptimizer::updatePopulation() {
     // copyStream_ must have finished delivering h_globalBestIdx_
     CUDA_CHECK(cudaStreamSynchronize(copyStream_));
 
-    // Block size: smallest power-of-2 >= D, capped at 1024
+    // Snapshot current positions so the Jacobi kernels read from a consistent
+    // pre-update state while writing new positions to d_positions_.
+    CUDA_CHECK(cudaMemcpyAsync(d_positions_old_, d_positions_,
+                               (size_t)N * D * sizeof(double),
+                               cudaMemcpyDeviceToDevice, computeStream_));
+
+    // Block size: smallest power-of-2 >= D, capped at 1024.
+    // Each of the N blocks handles one fly; blockDim.x covers all D dimensions.
     int blockSize = 1;
     while (blockSize < D && blockSize < 1024) blockSize <<= 1;
 
     if (config_.variant == DFOVariant::STANDARD) {
-        kernelUpdateDFO<<<1, blockSize, 0, computeStream_>>>(
-            d_positions_, d_fitness_, d_bestNeighborIdx_, d_rngStates_,
+        kernelUpdateDFO_Jacobi<<<N, blockSize, 0, computeStream_>>>(
+            d_positions_, d_positions_old_, d_bestNeighborIdx_, d_rngStates_,
             h_globalBestIdx_, config_.delta, N, D);
     } else {
-        kernelUpdateUDFO<<<1, blockSize, 0, computeStream_>>>(
-            d_positions_, d_fitness_, d_bestNeighborIdx_, d_rngStates_,
+        kernelUpdateUDFO_Jacobi<<<N, blockSize, 0, computeStream_>>>(
+            d_positions_, d_positions_old_, d_bestNeighborIdx_, d_rngStates_,
             h_globalBestIdx_, N, D, config_.variant);
     }
 }
@@ -355,8 +378,8 @@ inline void DFOOptimizer::debugPrintStats(int iter, FitnessFunction /*fitnessTyp
     printf("  [fitness range]  min=%.8e  max=%.8e  bestIdx=%d  kernelBest=%.8e\n",
            minFit, maxFit, h_globalBestIdx_, h_globalBestFitness_);
     if (fabs(minFit - h_globalBestFitness_) > 1e-10 * fabs(minFit) + 1e-20)
-        printf("  *** BUG: kernelFindGlobalBest returned %.8e but true min=%.8e — "
-               "warp reduction error! ***\n", h_globalBestFitness_, minFit);
+        printf("  *** BUG: two-phase reduction returned %.8e but true min=%.8e — "
+               "reduction error! ***\n", h_globalBestFitness_, minFit);
 
     printf("  [diversity]      uniqueFitness=%d/%d  collapsed=%d  exactFitMatch=%d\n",
            uniqueCount, N, collapsed, exactMatch);
@@ -418,7 +441,6 @@ inline DFOResult DFOOptimizer::optimize(FitnessFunction fitnessType) {
     if (!isInitialized_) initializePopulation();
 
     DFOResult result;
-    result.bestPosition = d_bestPosition_;
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));

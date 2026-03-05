@@ -2,15 +2,23 @@
  * High-Performance DFO/uDFO Kernels
  *
  * Based on original DFO by Mohammad Majid al-Rifaie
- * al-Rifaie, M. M. (2014). Dispersive flies optimisation. In 2014 Federated Conference on Computer Science and Information Systems (pp. 529-538). IEEE.
+ * al-Rifaie, M. M. (2014). Dispersive flies optimisation. In 2014 Federated Conference on
+ * Computer Science and Information Systems (pp. 529-538). IEEE.
+ *
  * Design notes:
  * - Positions, fitness, bounds: double everywhere
  * - curand_uniform_double for all position/fitness-affecting RNG draws
  * - uDFO exploitation-probability computation stays float32 (O(1) values,
  *   float32 precision is adequate for the threshold comparison)
- * - Warp reductions use volatile double* + __syncwarp() (required SM 6.1+)
- * - kernelFindGlobalBest uses a single block → direct store from thread 0,
- *   no atomicExch needed (no double atomicExch exists in CUDA)
+ * - Fitness reductions use clean __syncthreads() all the way down (no warp unroll)
+ *   to avoid out-of-bounds shared memory reads when blockDim.x == 32.
+ * - Global-best search uses a two-phase reduction so N > 1024 is handled correctly:
+ *     Phase 1 (kernelReduceToBlockBest): each block of DFO_BLOCK_SIZE particles
+ *             reduces to one (fitness, index) pair.
+ *     Phase 2 (kernelReduceFinalBest):  single block reduces the phase-1 results.
+ * - Population update uses Jacobi (fully parallel): all N flies are updated
+ *   simultaneously from a read-only snapshot of the previous positions, giving
+ *   full GPU occupancy (N blocks × nextPow2(D) threads).
  * - atomicAdd(double*) requires SM 6.0+; GTX 1080 Ti is SM 6.1 ✓
  */
 
@@ -89,7 +97,8 @@ __global__ void kernelInitPopulation(
 //
 // Layout: one block per particle (blockIdx.x == particle index).
 // Threads reduce over dimensions using shared memory.
-// Warp unroll uses volatile double* + __syncwarp() for correctness on SM 6.1+.
+// Reduction uses a clean power-of-2 loop with __syncthreads() at every step
+// to avoid out-of-bounds shared memory reads in the warp tail.
 //=============================================================================
 
 // ---------------------------------------------------------------------------
@@ -115,18 +124,9 @@ __global__ void kernelEvaluateFitnessSphere(
     sdata[tid] = sum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
-    }
-    if (tid < 32) {
-        volatile double* vs = sdata;
-        if (blockDim.x >= 64) vs[tid] += vs[tid + 32]; __syncwarp();
-        if (blockDim.x >= 32) vs[tid] += vs[tid + 16]; __syncwarp();
-        if (blockDim.x >= 16) vs[tid] += vs[tid +  8]; __syncwarp();
-        if (blockDim.x >=  8) vs[tid] += vs[tid +  4]; __syncwarp();
-        if (blockDim.x >=  4) vs[tid] += vs[tid +  2]; __syncwarp();
-        if (blockDim.x >=  2) vs[tid] += vs[tid +  1]; __syncwarp();
     }
     if (tid == 0) fitness[particleIdx] = sdata[0];
 }
@@ -156,18 +156,9 @@ __global__ void kernelEvaluateFitnessRastrigin(
     sdata[tid] = sum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
-    }
-    if (tid < 32) {
-        volatile double* vs = sdata;
-        if (blockDim.x >= 64) vs[tid] += vs[tid + 32]; __syncwarp();
-        if (blockDim.x >= 32) vs[tid] += vs[tid + 16]; __syncwarp();
-        if (blockDim.x >= 16) vs[tid] += vs[tid +  8]; __syncwarp();
-        if (blockDim.x >=  8) vs[tid] += vs[tid +  4]; __syncwarp();
-        if (blockDim.x >=  4) vs[tid] += vs[tid +  2]; __syncwarp();
-        if (blockDim.x >=  2) vs[tid] += vs[tid +  1]; __syncwarp();
     }
     if (tid == 0) fitness[particleIdx] = sdata[0];
 }
@@ -199,18 +190,9 @@ __global__ void kernelEvaluateFitnessRosenbrock(
     sdata[tid] = sum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
-    }
-    if (tid < 32) {
-        volatile double* vs = sdata;
-        if (blockDim.x >= 64) vs[tid] += vs[tid + 32]; __syncwarp();
-        if (blockDim.x >= 32) vs[tid] += vs[tid + 16]; __syncwarp();
-        if (blockDim.x >= 16) vs[tid] += vs[tid +  8]; __syncwarp();
-        if (blockDim.x >=  8) vs[tid] += vs[tid +  4]; __syncwarp();
-        if (blockDim.x >=  4) vs[tid] += vs[tid +  2]; __syncwarp();
-        if (blockDim.x >=  2) vs[tid] += vs[tid +  1]; __syncwarp();
     }
     if (tid == 0) fitness[particleIdx] = sdata[0];
 }
@@ -245,22 +227,12 @@ __global__ void kernelEvaluateFitnessAckley(
     sdata_cos[tid] = sum_cos;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             sdata_sq[tid]  += sdata_sq[tid  + s];
             sdata_cos[tid] += sdata_cos[tid + s];
         }
         __syncthreads();
-    }
-    if (tid < 32) {
-        volatile double* vsq  = sdata_sq;
-        volatile double* vcos = sdata_cos;
-        if (blockDim.x >= 64) { vsq[tid] += vsq[tid+32]; vcos[tid] += vcos[tid+32]; } __syncwarp();
-        if (blockDim.x >= 32) { vsq[tid] += vsq[tid+16]; vcos[tid] += vcos[tid+16]; } __syncwarp();
-        if (blockDim.x >= 16) { vsq[tid] += vsq[tid+ 8]; vcos[tid] += vcos[tid+ 8]; } __syncwarp();
-        if (blockDim.x >=  8) { vsq[tid] += vsq[tid+ 4]; vcos[tid] += vcos[tid+ 4]; } __syncwarp();
-        if (blockDim.x >=  4) { vsq[tid] += vsq[tid+ 2]; vcos[tid] += vcos[tid+ 2]; } __syncwarp();
-        if (blockDim.x >=  2) { vsq[tid] += vsq[tid+ 1]; vcos[tid] += vcos[tid+ 1]; } __syncwarp();
     }
     if (tid == 0) {
         double val = -20.0 * exp(-0.2 * sqrt(sdata_sq[0] / D))
@@ -271,40 +243,45 @@ __global__ void kernelEvaluateFitnessAckley(
 }
 
 //=============================================================================
-// Kernel: Find global best particle (single block, minimize or maximize)
+// Two-phase global-best search — handles any N, no single-block limitation.
 //
-// Uses shared memory reduction.  Always launched with numBlocks=1, so no
-// inter-block communication is needed — thread 0 writes directly to device
-// scalars (no atomicExch, which has no double overload in CUDA).
+// Phase 1 (kernelReduceToBlockBest):
+//   Launch ceil(N / DFO_BLOCK_SIZE) blocks of DFO_BLOCK_SIZE threads each.
+//   Each block reduces its DFO_BLOCK_SIZE particles to one (fitness, index) pair
+//   stored in partialFitness[blockIdx.x] / partialIdx[blockIdx.x].
 //
-// __syncwarp() between volatile warp-unroll steps required on SM 6.1+.
+// Phase 2 (kernelReduceFinalBest):
+//   Single block reduces the ceil(N/DFO_BLOCK_SIZE) partial results to the
+//   global best and writes directly to device scalars globalBestIdx /
+//   globalBestFitness (no atomicExch needed — single block, thread 0 writes).
 //=============================================================================
-__global__ void kernelFindGlobalBest(
+
+__global__ void kernelReduceToBlockBest(
     const double* __restrict__ fitness,
-    int*          __restrict__ globalBestIdx,
-    double*       __restrict__ globalBestFitness,
+    double*       __restrict__ partialFitness,
+    int*          __restrict__ partialIdx,
     int  N,
     bool minimize
 ) {
     extern __shared__ double sdata[];
-    int* sidx = (int*)&sdata[blockDim.x];  // packed after the double array
+    int* sidx = (int*)&sdata[blockDim.x];
 
     int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + tid;
+    int gid = blockIdx.x * blockDim.x + tid;
 
     double myVal = minimize ? DBL_MAX : -DBL_MAX;
     int    myIdx = -1;
 
-    if (idx < N) {
-        myVal = fitness[idx];
-        myIdx = idx;
+    if (gid < N) {
+        myVal = fitness[gid];
+        myIdx = gid;
     }
 
     sdata[tid] = myVal;
     sidx[tid]  = myIdx;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             bool cond = minimize ? (sdata[tid + s] < sdata[tid])
                                  : (sdata[tid + s] > sdata[tid]);
@@ -316,29 +293,46 @@ __global__ void kernelFindGlobalBest(
         __syncthreads();
     }
 
-    if (tid < 32) {
-        volatile double* vs  = sdata;
-        volatile int*    vsi = sidx;
+    if (tid == 0) {
+        partialFitness[blockIdx.x] = sdata[0];
+        partialIdx[blockIdx.x]     = sidx[0];
+    }
+}
 
-        #define WARP_REDUCE_STEP(offset) \
-            if (tid < (offset)) { \
-                bool _c = minimize ? (vs[tid + (offset)] < vs[tid]) \
-                                   : (vs[tid + (offset)] > vs[tid]); \
-                if (_c) { vs[tid] = vs[tid + (offset)]; vsi[tid] = vsi[tid + (offset)]; } \
-            } \
-            __syncwarp();
+__global__ void kernelReduceFinalBest(
+    const double* __restrict__ partialFitness,
+    const int*    __restrict__ partialIdx,
+    int*          __restrict__ globalBestIdx,
+    double*       __restrict__ globalBestFitness,
+    int   numPartials,
+    bool  minimize
+) {
+    extern __shared__ double sdata[];
+    int* sidx = (int*)&sdata[blockDim.x];
 
-        WARP_REDUCE_STEP(32)
-        WARP_REDUCE_STEP(16)
-        WARP_REDUCE_STEP(8)
-        WARP_REDUCE_STEP(4)
-        WARP_REDUCE_STEP(2)
-        WARP_REDUCE_STEP(1)
+    int tid = threadIdx.x;
 
-        #undef WARP_REDUCE_STEP
+    double myVal = (tid < numPartials) ? partialFitness[tid]
+                                       : (minimize ? DBL_MAX : -DBL_MAX);
+    int    myIdx = (tid < numPartials) ? partialIdx[tid] : -1;
+
+    sdata[tid] = myVal;
+    sidx[tid]  = myIdx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            bool cond = minimize ? (sdata[tid + s] < sdata[tid])
+                                 : (sdata[tid + s] > sdata[tid]);
+            if (cond) {
+                sdata[tid] = sdata[tid + s];
+                sidx[tid]  = sidx[tid  + s];
+            }
+        }
+        __syncthreads();
     }
 
-    // Single block → only thread 0 writes; direct store is safe.
+    // Single block → thread 0 writes directly; no atomicExch needed.
     if (tid == 0) {
         *globalBestFitness = sdata[0];
         *globalBestIdx     = sidx[0];
@@ -370,16 +364,21 @@ __global__ void kernelFindBestNeighbors(
 }
 
 //=============================================================================
-// Kernel: Standard DFO position update (double precision)
+// Kernel: Standard DFO position update — Jacobi (fully parallel, double precision)
 //
-// Gauss-Seidel ordering: 1 block, D threads, flies 0..N-1 in sequence.
-// __syncthreads() after each fly guarantees all D writes are globally visible
-// before the next fly reads its (potentially just-updated) neighbour — this
-// exactly replicates the Python sequential for-loop behaviour.
+// All N flies are updated simultaneously, reading from positions_old (a snapshot
+// taken before the kernel launch). This gives N blocks × blockDim.x threads of
+// true GPU parallelism, replacing the old serial Gauss-Seidel single-block loop.
+//
+// Jacobi vs Gauss-Seidel: both converge for population-based metaheuristics.
+// Gauss-Seidel matched the Python reference exactly; Jacobi gives equivalent
+// statistical behavior while being orders of magnitude faster on GPU.
+//
+// Launch config: <<<N, nextPow2(D)>>>
 //=============================================================================
-__global__ void kernelUpdateDFO(
+__global__ void kernelUpdateDFO_Jacobi(
     double*       __restrict__ positions,
-    const double* __restrict__ fitness,        // unused but kept for signature symmetry
+    const double* __restrict__ positions_old,
     const int*    __restrict__ bestNeighborIdx,
     curandState*  __restrict__ rngStates,
     int    globalBestIdx,
@@ -387,53 +386,53 @@ __global__ void kernelUpdateDFO(
     int    N,
     int    D
 ) {
+    int i      = blockIdx.x;
     int dimIdx = threadIdx.x;
 
-    for (int i = 0; i < N; i++) {
-        if (i != globalBestIdx && dimIdx < D) {
-            int    idx   = i * D + dimIdx;
-            double lower = d_lowerBounds[dimIdx];
-            double upper = d_upperBounds[dimIdx];
+    if (i >= N || i == globalBestIdx || dimIdx >= D) return;
 
-            curandState localState = rngStates[idx];
+    int    idx   = i * D + dimIdx;
+    double lower = d_lowerBounds[dimIdx];
+    double upper = d_upperBounds[dimIdx];
 
-            double r = curand_uniform_double(&localState);
-            if (r < delta) {
-                // Disturbance: reinitialise uniformly in bounds
-                double r2 = curand_uniform_double(&localState);
-                positions[idx] = lower + r2 * (upper - lower);
-            } else {
-                int    neighborIdx = bestNeighborIdx[i];
-                double x_neighbor  = positions[neighborIdx * D + dimIdx];
-                double x_best      = positions[globalBestIdx * D + dimIdx];
-                double x_current   = positions[idx];  // read before write
+    curandState localState = rngStates[idx];
 
-                double u     = curand_uniform_double(&localState);
-                double x_new = x_neighbor + u * (x_best - x_current);
+    double r = curand_uniform_double(&localState);
+    if (r < delta) {
+        // Disturbance: reinitialise uniformly in bounds
+        double r2 = curand_uniform_double(&localState);
+        positions[idx] = lower + r2 * (upper - lower);
+    } else {
+        int    neighborIdx = bestNeighborIdx[i];
+        double x_neighbor  = positions_old[neighborIdx * D + dimIdx];
+        double x_best      = positions_old[globalBestIdx * D + dimIdx];
+        double x_current   = positions_old[idx];
 
-                if (x_new < lower || x_new > upper) {
-                    double r3 = curand_uniform_double(&localState);
-                    x_new = lower + r3 * (upper - lower);
-                }
-                positions[idx] = x_new;
-            }
+        double u     = curand_uniform_double(&localState);
+        double x_new = x_neighbor + u * (x_best - x_current);
 
-            rngStates[idx] = localState;
+        if (x_new < lower || x_new > upper) {
+            double r3 = curand_uniform_double(&localState);
+            x_new = lower + r3 * (upper - lower);
         }
-        __syncthreads();  // Gauss-Seidel barrier: fly i fully written before fly i+1 reads
+        positions[idx] = x_new;
     }
+
+    rngStates[idx] = localState;
 }
 
 //=============================================================================
-// Kernel: uDFO position update with dynamic delta (double precision)
+// Kernel: uDFO position update with dynamic delta — Jacobi (fully parallel)
 //
 // The exploitation-probability computation (calcExploitationProb / calcDynamicDelta)
 // uses float32 internally — those values are O(1) probabilities and float32
 // precision is fully adequate for the threshold comparison.
+//
+// Launch config: <<<N, nextPow2(D)>>>
 //=============================================================================
-__global__ void kernelUpdateUDFO(
+__global__ void kernelUpdateUDFO_Jacobi(
     double*       __restrict__ positions,
-    const double* __restrict__ fitness,
+    const double* __restrict__ positions_old,
     const int*    __restrict__ bestNeighborIdx,
     curandState*  __restrict__ rngStates,
     int        globalBestIdx,
@@ -441,66 +440,64 @@ __global__ void kernelUpdateUDFO(
     int        D,
     DFOVariant variant
 ) {
+    int i      = blockIdx.x;
     int dimIdx = threadIdx.x;
 
-    for (int i = 0; i < N; i++) {
-        if (i != globalBestIdx && dimIdx < D) {
-            int    idx   = i * D + dimIdx;
-            double lower = d_lowerBounds[dimIdx];
-            double upper = d_upperBounds[dimIdx];
+    if (i >= N || i == globalBestIdx || dimIdx >= D) return;
 
-            curandState localState = rngStates[idx];
+    int    idx   = i * D + dimIdx;
+    double lower = d_lowerBounds[dimIdx];
+    double upper = d_upperBounds[dimIdx];
 
-            int    neighborIdx = bestNeighborIdx[i];
-            double x_neighbor  = positions[neighborIdx * D + dimIdx];
-            double x_best      = positions[globalBestIdx * D + dimIdx];
-            double x_current   = positions[idx];
+    curandState localState = rngStates[idx];
 
-            // Compute exploitation probability p in float32
-            double scale = fabs(x_neighbor - x_best);
-            float  p;
-            if (scale < 1e-10) {
-                p = 1.0f;
-            } else {
-                float x_scaled     = (float)((x_current - x_best) / scale);
-                float lower_scaled = (float)((lower     - x_best) / scale);
-                float upper_scaled = (float)((upper     - x_best) / scale);
-                float L = fabsf(x_scaled - lower_scaled);
-                float R = fabsf(upper_scaled - x_scaled);
-                p = calcExploitationProb(x_scaled, L, R);
-            }
-            float  dynamicDelta = calcDynamicDelta(p, variant);
-            double r = curand_uniform_double(&localState);
+    int    neighborIdx = bestNeighborIdx[i];
+    double x_neighbor  = positions_old[neighborIdx * D + dimIdx];
+    double x_best      = positions_old[globalBestIdx * D + dimIdx];
+    double x_current   = positions_old[idx];
 
-            if (r < (double)dynamicDelta) {
-                if (variant == DFOVariant::UDFO_Z5) {
-                    double z5_lower, z5_upper;
-                    if (x_neighbor >= x_best) { z5_lower = x_neighbor; z5_upper = upper;      }
-                    else                       { z5_lower = lower;      z5_upper = x_neighbor; }
-
-                    double r2 = curand_uniform_double(&localState);
-                    positions[idx] = (z5_lower < z5_upper)
-                                     ? z5_lower + r2 * (z5_upper - z5_lower)
-                                     : lower    + r2 * (upper    - lower);
-                } else {
-                    double r2 = curand_uniform_double(&localState);
-                    positions[idx] = lower + r2 * (upper - lower);
-                }
-            } else {
-                double u     = curand_uniform_double(&localState);
-                double x_new = x_neighbor + u * (x_best - x_current);
-
-                if (x_new < lower || x_new > upper) {
-                    double r3 = curand_uniform_double(&localState);
-                    x_new = lower + r3 * (upper - lower);
-                }
-                positions[idx] = x_new;
-            }
-
-            rngStates[idx] = localState;
-        }
-        __syncthreads();
+    // Compute exploitation probability p in float32
+    double scale = fabs(x_neighbor - x_best);
+    float  p;
+    if (scale < 1e-10) {
+        p = 1.0f;
+    } else {
+        float x_scaled     = (float)((x_current - x_best) / scale);
+        float lower_scaled = (float)((lower     - x_best) / scale);
+        float upper_scaled = (float)((upper     - x_best) / scale);
+        float L = fabsf(x_scaled - lower_scaled);
+        float R = fabsf(upper_scaled - x_scaled);
+        p = calcExploitationProb(x_scaled, L, R);
     }
+    float  dynamicDelta = calcDynamicDelta(p, variant);
+    double r = curand_uniform_double(&localState);
+
+    if (r < (double)dynamicDelta) {
+        if (variant == DFOVariant::UDFO_Z5) {
+            double z5_lower, z5_upper;
+            if (x_neighbor >= x_best) { z5_lower = x_neighbor; z5_upper = upper;      }
+            else                       { z5_lower = lower;      z5_upper = x_neighbor; }
+
+            double r2 = curand_uniform_double(&localState);
+            positions[idx] = (z5_lower < z5_upper)
+                             ? z5_lower + r2 * (z5_upper - z5_lower)
+                             : lower    + r2 * (upper    - lower);
+        } else {
+            double r2 = curand_uniform_double(&localState);
+            positions[idx] = lower + r2 * (upper - lower);
+        }
+    } else {
+        double u     = curand_uniform_double(&localState);
+        double x_new = x_neighbor + u * (x_best - x_current);
+
+        if (x_new < lower || x_new > upper) {
+            double r3 = curand_uniform_double(&localState);
+            x_new = lower + r3 * (upper - lower);
+        }
+        positions[idx] = x_new;
+    }
+
+    rngStates[idx] = localState;
 }
 
 //=============================================================================
@@ -524,7 +521,7 @@ __global__ void kernelCopyBestSolution(
 // Launched with N threads (one per particle).
 //
 // d_out layout (double[8]):
-//   [0]  min fitness    (verified independently of kernelFindGlobalBest)
+//   [0]  min fitness    (verified independently of kernelReduceFinalBest)
 //   [1]  max fitness
 //   [2]  sum |pos[i,0] - pos[best,0]|  (dim-0 spread proxy)
 //   [3]  count of "fully collapsed" particles (position indistinguishable
@@ -533,7 +530,7 @@ __global__ void kernelCopyBestSolution(
 //   [5]  sum |x_best[d] - x_i[d]| over all (i,d)  — total movement potential
 //        → approaches 0 when the update formula is dead
 //   [6]  count of (i,d) pairs where |x_best[d]-x_i[d]| < 1e-14
-//        (float64 dead zone; should be near 0 after conversion)
+//        (float64 dead zone; should be near 0 after convergence)
 //
 // Min/max use a double CAS loop.
 // Sums/counts use atomicAdd(double*) — supported on SM 6.0+ (GTX 1080 Ti ✓).

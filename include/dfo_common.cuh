@@ -78,9 +78,9 @@ struct DFOConfig {
 };
 
 // Result structure
+// Use DFOOptimizer::getBestSolution() to retrieve the best position as a host vector.
 struct DFOResult {
     double  bestFitness;
-    double* bestPosition;   // Device pointer
     int     iterations;
     float   elapsedTimeMs;
 };
@@ -129,6 +129,10 @@ __device__ __forceinline__ float calcDynamicDelta(float p, DFOVariant variant) {
     switch (variant) {
         case DFOVariant::UDFO_1000P: return 1.0f / (1000.0f * p);
         case DFOVariant::UDFO_1500P: return 1.0f / (1500.0f * p);
+        // UDFO_Z5 uses the same 1500p delta formula as UDFO_1500P.
+        // The Z5 variant is distinguished solely by its zone-5 relocation strategy
+        // (see kernelUpdateUDFO_Jacobi), not by a different delta scaling.
+        // Reference: al-Rifaie (2021), Entropy 23(8), 977.
         case DFOVariant::UDFO_Z5:    return 1.0f / (1500.0f * p);
         default:                     return (float)d_delta;
     }

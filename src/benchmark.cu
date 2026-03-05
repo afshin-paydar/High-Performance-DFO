@@ -21,7 +21,6 @@
 #include <algorithm>
 
 #include "../include/dfo_optimizer.cuh"
-#include "../include/dfo_benchmark_functions.cuh"
 
 // Benchmark configuration
 struct BenchmarkConfig {
@@ -93,19 +92,27 @@ RunStats runBenchmark(
         config.dimensions = cfg.dimensions;
         config.maxIterations = cfg.maxIterations;
         config.variant = variant;
-        config.delta = 0.001f;
+        config.delta = 0.001;
         config.seed = 12345ULL + run * 1000; // Different seed each run
 
         DFOOptimizer optimizer(config);
 
-        // Set bounds based on function
+        // Set standard benchmark bounds per function
         switch (fitnessType) {
             case FitnessFunction::SPHERE:
+                optimizer.setUniformBounds(-100.0, 100.0);
+                break;
             case FitnessFunction::RASTRIGIN:
-                optimizer.setUniformBounds(-5.12f, 5.12f);
+                optimizer.setUniformBounds(-5.12, 5.12);
+                break;
+            case FitnessFunction::ROSENBROCK:
+                optimizer.setUniformBounds(-30.0, 30.0);
+                break;
+            case FitnessFunction::ACKLEY:
+                optimizer.setUniformBounds(-32.768, 32.768);
                 break;
             default:
-                optimizer.setUniformBounds(-5.12f, 5.12f);
+                optimizer.setUniformBounds(-100.0, 100.0);
         }
 
         // Suppress output for benchmark runs
