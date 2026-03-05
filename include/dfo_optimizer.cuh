@@ -297,8 +297,8 @@ inline void DFOOptimizer::updatePopulation() {
             d_positions_, d_bestNeighborIdx_, d_rngStates_,
             h_globalBestIdx_, config_.delta, N, D);
     } else {
-        kernelUpdateUDFO_Jacobi<<<N, blockSize, 0, computeStream_>>>(
-            d_positions_, d_positions_old_, d_bestNeighborIdx_, d_rngStates_,
+        kernelUpdateUDFO_GaussSeidel<<<1, blockSize, 0, computeStream_>>>(
+            d_positions_, d_bestNeighborIdx_, d_rngStates_,
             h_globalBestIdx_, N, D, config_.variant);
     }
 }

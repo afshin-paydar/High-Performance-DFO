@@ -438,82 +438,92 @@ __global__ void kernelUpdateDFO_GaussSeidel(
 }
 
 //=============================================================================
-// Kernel: uDFO position update with dynamic delta — Jacobi (fully parallel)
+// Kernel: uDFO position update — Gauss-Seidel (all variants)
 //
-// The exploitation-probability computation (calcExploitationProb / calcDynamicDelta)
-// uses float32 internally — those values are O(1) probabilities and float32
-// precision is fully adequate for the threshold comparison.
+// Same Gauss-Seidel structure as kernelUpdateDFO_GaussSeidel: sequential
+// loop over flies, D threads per fly, unconditional __syncthreads() at the
+// bottom of every iteration.
 //
-// Launch config: <<<N, nextPow2(D)>>>
+// Gauss-Seidel asymmetry (matches Python):
+//   - Left neighbour (index i-1): already updated in the current sweep.
+//   - Right neighbour (index i+1): not yet updated.
+//   - Global best (globalBestIdx): never written (elitist skip).
+//
+// The exploitation-probability computation uses float32 (O(1) scaled values,
+// float32 precision is adequate for the threshold comparison).
+//
+// Requires D <= DFO_MAX_DIMS (1024). positions is NOT __restrict__.
+//
+// Launch config: <<<1, nextPow2(D)>>>
 //=============================================================================
-__global__ void kernelUpdateUDFO_Jacobi(
-    double*       __restrict__ positions,
-    const double* __restrict__ positions_old,
-    const int*    __restrict__ bestNeighborIdx,
-    curandState*  __restrict__ rngStates,
+__global__ void kernelUpdateUDFO_GaussSeidel(
+    double*      positions,
+    const int*   __restrict__ bestNeighborIdx,
+    curandState* __restrict__ rngStates,
     int        globalBestIdx,
     int        N,
     int        D,
     DFOVariant variant
 ) {
-    int i      = blockIdx.x;
     int dimIdx = threadIdx.x;
 
-    if (i >= N || i == globalBestIdx || dimIdx >= D) return;
+    for (int i = 0; i < N; i++) {
+        if (i != globalBestIdx && dimIdx < D) {
+            int    idx   = i * D + dimIdx;
+            double lower = d_lowerBounds[dimIdx];
+            double upper = d_upperBounds[dimIdx];
 
-    int    idx   = i * D + dimIdx;
-    double lower = d_lowerBounds[dimIdx];
-    double upper = d_upperBounds[dimIdx];
+            curandState localState = rngStates[idx];
 
-    curandState localState = rngStates[idx];
+            int    neighborIdx = bestNeighborIdx[i];
+            double x_neighbor  = positions[neighborIdx * D + dimIdx];
+            double x_best      = positions[globalBestIdx * D + dimIdx];
+            double x_current   = positions[idx];
 
-    int    neighborIdx = bestNeighborIdx[i];
-    double x_neighbor  = positions_old[neighborIdx * D + dimIdx];
-    double x_best      = positions_old[globalBestIdx * D + dimIdx];
-    double x_current   = positions_old[idx];
+            // Compute exploitation probability p in float32
+            double scale = fabs(x_neighbor - x_best);
+            float  p;
+            if (scale < 1e-10) {
+                p = 1.0f;
+            } else {
+                float x_scaled     = (float)((x_current - x_best) / scale);
+                float lower_scaled = (float)((lower     - x_best) / scale);
+                float upper_scaled = (float)((upper     - x_best) / scale);
+                float L = fabsf(x_scaled - lower_scaled);
+                float R = fabsf(upper_scaled - x_scaled);
+                p = calcExploitationProb(x_scaled, L, R);
+            }
+            float  dynamicDelta = calcDynamicDelta(p, variant);
+            double r = curand_uniform_double(&localState);
 
-    // Compute exploitation probability p in float32
-    double scale = fabs(x_neighbor - x_best);
-    float  p;
-    if (scale < 1e-10) {
-        p = 1.0f;
-    } else {
-        float x_scaled     = (float)((x_current - x_best) / scale);
-        float lower_scaled = (float)((lower     - x_best) / scale);
-        float upper_scaled = (float)((upper     - x_best) / scale);
-        float L = fabsf(x_scaled - lower_scaled);
-        float R = fabsf(upper_scaled - x_scaled);
-        p = calcExploitationProb(x_scaled, L, R);
-    }
-    float  dynamicDelta = calcDynamicDelta(p, variant);
-    double r = curand_uniform_double(&localState);
+            double x_new;
+            if (r < (double)dynamicDelta) {
+                if (variant == DFOVariant::UDFO_Z5) {
+                    double z5_lower, z5_upper;
+                    if (x_neighbor >= x_best) { z5_lower = x_neighbor; z5_upper = upper;      }
+                    else                       { z5_lower = lower;      z5_upper = x_neighbor; }
+                    double r2 = curand_uniform_double(&localState);
+                    x_new = (z5_lower < z5_upper)
+                            ? z5_lower + r2 * (z5_upper - z5_lower)
+                            : lower    + r2 * (upper    - lower);
+                } else {
+                    double r2 = curand_uniform_double(&localState);
+                    x_new = lower + r2 * (upper - lower);
+                }
+            } else {
+                double u = curand_uniform_double(&localState);
+                x_new = x_neighbor + u * (x_best - x_current);
+                if (x_new < lower || x_new > upper) {
+                    double r3 = curand_uniform_double(&localState);
+                    x_new = lower + r3 * (upper - lower);
+                }
+            }
 
-    if (r < (double)dynamicDelta) {
-        if (variant == DFOVariant::UDFO_Z5) {
-            double z5_lower, z5_upper;
-            if (x_neighbor >= x_best) { z5_lower = x_neighbor; z5_upper = upper;      }
-            else                       { z5_lower = lower;      z5_upper = x_neighbor; }
-
-            double r2 = curand_uniform_double(&localState);
-            positions[idx] = (z5_lower < z5_upper)
-                             ? z5_lower + r2 * (z5_upper - z5_lower)
-                             : lower    + r2 * (upper    - lower);
-        } else {
-            double r2 = curand_uniform_double(&localState);
-            positions[idx] = lower + r2 * (upper - lower);
+            rngStates[idx] = localState;
+            positions[idx] = x_new;
         }
-    } else {
-        double u     = curand_uniform_double(&localState);
-        double x_new = x_neighbor + u * (x_best - x_current);
-
-        if (x_new < lower || x_new > upper) {
-            double r3 = curand_uniform_double(&localState);
-            x_new = lower + r3 * (upper - lower);
-        }
-        positions[idx] = x_new;
+        __syncthreads();   // unconditional barrier — all threads every iteration
     }
-
-    rngStates[idx] = localState;
 }
 
 //=============================================================================

@@ -58,6 +58,7 @@ struct DFOConfig {
     unsigned long long seed;
     bool debug;            // Enable per-iteration diagnostic output (--debug)
     int  debugInterval;    // How often to print debug stats (default: 100)
+    int  printInterval;    // How often to print fitness line (0 = maxIterations/10)
 
     // Optional per-dimension bounds (host side; actual bounds go via setBounds())
     double* lowerBounds;
@@ -73,6 +74,7 @@ struct DFOConfig {
           seed(static_cast<unsigned long long>(time(nullptr))),
           debug(false),
           debugInterval(100),
+          printInterval(0),
           lowerBounds(nullptr),
           upperBounds(nullptr) {}
 };
@@ -131,7 +133,7 @@ __device__ __forceinline__ float calcDynamicDelta(float p, DFOVariant variant) {
         case DFOVariant::UDFO_1500P: return 1.0f / (1500.0f * p);
         // UDFO_Z5 uses the same 1500p delta formula as UDFO_1500P.
         // The Z5 variant is distinguished solely by its zone-5 relocation strategy
-        // (see kernelUpdateUDFO_Jacobi), not by a different delta scaling.
+        // (see kernelUpdateUDFO_GaussSeidel), not by a different delta scaling.
         // Reference: al-Rifaie (2021), Entropy 23(8), 977.
         case DFOVariant::UDFO_Z5:    return 1.0f / (1500.0f * p);
         default:                     return (float)d_delta;
