@@ -453,6 +453,7 @@ __global__ void kernelUpdateDFO_GaussSeidel(
 // float32 precision is adequate for the threshold comparison).
 //
 // Requires D <= DFO_MAX_DIMS (1024). positions is NOT __restrict__.
+// variant must be UDFO_1000P, UDFO_1500P, or UDFO_Z5 (not STANDARD).
 //
 // Launch config: <<<1, nextPow2(D)>>>
 //=============================================================================
@@ -500,6 +501,8 @@ __global__ void kernelUpdateUDFO_GaussSeidel(
             if (r < (double)dynamicDelta) {
                 if (variant == DFOVariant::UDFO_Z5) {
                     double z5_lower, z5_upper;
+                    // x_neighbor reflects Gauss-Seidel ordering: may be already-updated in
+                    // current sweep (left neighbour) or pre-sweep (right neighbour).
                     if (x_neighbor >= x_best) { z5_lower = x_neighbor; z5_upper = upper;      }
                     else                       { z5_lower = lower;      z5_upper = x_neighbor; }
                     double r2 = curand_uniform_double(&localState);

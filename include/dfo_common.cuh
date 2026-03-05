@@ -128,6 +128,8 @@ __device__ __forceinline__ float calcExploitationProb(float x, float L, float R)
 
 __device__ __forceinline__ float calcDynamicDelta(float p, DFOVariant variant) {
     if (p <= 0.0f) return 1.0f;
+    // Return value may exceed 1.0 (when p is small) — this is intentional:
+    // r < dynamicDelta then always triggers relocation ("always relocate" semantics).
     switch (variant) {
         case DFOVariant::UDFO_1000P: return 1.0f / (1000.0f * p);
         case DFOVariant::UDFO_1500P: return 1.0f / (1500.0f * p);
