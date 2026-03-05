@@ -369,14 +369,28 @@ __global__ void kernelFindBestNeighbors(
 //
 // Processes flies sequentially i=0..N-1 inside a single block.
 // D threads handle all dimensions of fly i in parallel.
+//
 // __syncthreads() is called UNCONDITIONALLY at the end of every loop
-// iteration so that fly i+1 sees fly i's written positions (global memory
-// fence within the block).  This exactly reproduces Python's in-order sweep:
-//   - left neighbour (index i-1) is already updated when fly i runs → same as Python
-//   - global best (globalBestIdx) is never written → always old value → same as Python
+// iteration: it is a full execution and memory barrier for all threads in the
+// block, ensuring every thread has committed its write to global memory before
+// any thread proceeds to the next fly.  This guarantees fly i+1 sees fly i's
+// written positions — exactly reproducing Python's in-order sweep.
+//
+// Gauss-Seidel asymmetry (matches Python):
+//   - Left neighbour (index i-1): already updated in the current sweep
+//     → fly i reads the freshly written position of i-1.
+//   - Right neighbour (index i+1): not yet updated in the current sweep
+//     → fly i reads the old position of i+1.
+//   - Global best (globalBestIdx): never written (elitist skip)
+//     → fly i always reads the pre-iteration best position.
+//
+// Requires D <= DFO_MAX_DIMS (currently 1024). The single-block design caps
+// blockSize at 1024; if DFO_MAX_DIMS were raised above 1024 without switching
+// to a multi-block approach, dimensions >= 1024 would silently not be updated.
+//
+// positions is NOT __restrict__ (same array is read and written in-place).
 //
 // Launch config: <<<1, nextPow2(D)>>>
-// positions is NOT __restrict__ (same array is read and written).
 //=============================================================================
 __global__ void kernelUpdateDFO_GaussSeidel(
     double*      positions,
