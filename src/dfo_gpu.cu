@@ -38,7 +38,8 @@ void printUsage(const char* progName) {
     printf("  ackley     - Ackley      [-32.768, 32.768]^n\n\n");
     printf("Debug options:\n");
     printf("  --debug               Enable per-iteration diagnostic output\n");
-    printf("  --debug-interval K    Print debug stats every K iterations (default: 100)\n\n");
+    printf("  --debug-interval K    Print debug stats every K iterations (default: 100)\n");
+    printf("  --print-interval K    Print best fitness every K iterations (default: maxIter/10)\n\n");
     printf("Defaults: standard sphere 100 30 1000\n");
 }
 
@@ -70,6 +71,11 @@ void parseArgs(int argc, char** argv, DFOConfig& config, FitnessFunction& fitnes
             if (i + 1 < argc) {
                 config.debugInterval = atoi(argv[++i]);
                 if (config.debugInterval <= 0) config.debugInterval = 100;
+            }
+        } else if (strcmp(argv[i], "--print-interval") == 0) {
+            if (i + 1 < argc) {
+                config.printInterval = atoi(argv[++i]);
+                if (config.printInterval <= 0) config.printInterval = 1;
             }
         } else {
             posArgs.push_back(argv[i]);
@@ -252,6 +258,9 @@ int main(int argc, char** argv) {
     printf("Delta (standard DFO): %.4f\n", config.delta);
     printf("Bounds: [%.4g, %.4g]\n", lower, upper);
     printf("RNG seed: %llu\n", config.seed);
+    printf("Print interval: every %d iterations%s\n",
+           (config.printInterval > 0) ? config.printInterval : config.maxIterations / 10,
+           (config.printInterval > 0) ? "" : " (default: maxIter/10)");
     if (config.debug)
         printf("Debug: ON (every %d iterations)\n", config.debugInterval);
     else
