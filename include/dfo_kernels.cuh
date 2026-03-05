@@ -16,9 +16,10 @@
  *     Phase 1 (kernelReduceToBlockBest): each block of DFO_BLOCK_SIZE particles
  *             reduces to one (fitness, index) pair.
  *     Phase 2 (kernelReduceFinalBest):  single block reduces the phase-1 results.
- * - Population update uses Jacobi (fully parallel): all N flies are updated
- *   simultaneously from a read-only snapshot of the previous positions, giving
- *   full GPU occupancy (N blocks × nextPow2(D) threads).
+ * - Population update uses Gauss-Seidel (sequential fly loop, single block):
+ *   D threads handle all dimensions of each fly in parallel; __syncthreads()
+ *   after each fly ensures fly i+1 sees fly i's written positions, exactly
+ *   matching the Python reference sweep order.
  * - atomicAdd(double*) requires SM 6.0+; GTX 1080 Ti is SM 6.1 ✓
  */
 
@@ -364,61 +365,62 @@ __global__ void kernelFindBestNeighbors(
 }
 
 //=============================================================================
-// Kernel: Standard DFO position update — Jacobi (fully parallel, double precision)
+// Kernel: Standard DFO position update — Gauss-Seidel (exact Python match)
 //
-// All N flies are updated simultaneously, reading from positions_old (a snapshot
-// taken before the kernel launch). This gives N blocks × blockDim.x threads of
-// true GPU parallelism, replacing the old serial Gauss-Seidel single-block loop.
+// Processes flies sequentially i=0..N-1 inside a single block.
+// D threads handle all dimensions of fly i in parallel.
+// __syncthreads() is called UNCONDITIONALLY at the end of every loop
+// iteration so that fly i+1 sees fly i's written positions (global memory
+// fence within the block).  This exactly reproduces Python's in-order sweep:
+//   - left neighbour (index i-1) is already updated when fly i runs → same as Python
+//   - global best (globalBestIdx) is never written → always old value → same as Python
 //
-// Jacobi vs Gauss-Seidel: both converge for population-based metaheuristics.
-// Gauss-Seidel matched the Python reference exactly; Jacobi gives equivalent
-// statistical behavior while being orders of magnitude faster on GPU.
-//
-// Launch config: <<<N, nextPow2(D)>>>
+// Launch config: <<<1, nextPow2(D)>>>
+// positions is NOT __restrict__ (same array is read and written).
 //=============================================================================
-__global__ void kernelUpdateDFO_Jacobi(
-    double*       __restrict__ positions,
-    const double* __restrict__ positions_old,
-    const int*    __restrict__ bestNeighborIdx,
-    curandState*  __restrict__ rngStates,
+__global__ void kernelUpdateDFO_GaussSeidel(
+    double*      positions,
+    const int*   __restrict__ bestNeighborIdx,
+    curandState* __restrict__ rngStates,
     int    globalBestIdx,
     double delta,
     int    N,
     int    D
 ) {
-    int i      = blockIdx.x;
     int dimIdx = threadIdx.x;
 
-    if (i >= N || i == globalBestIdx || dimIdx >= D) return;
+    for (int i = 0; i < N; i++) {
+        if (i != globalBestIdx && dimIdx < D) {
+            int    idx   = i * D + dimIdx;
+            double lower = d_lowerBounds[dimIdx];
+            double upper = d_upperBounds[dimIdx];
 
-    int    idx   = i * D + dimIdx;
-    double lower = d_lowerBounds[dimIdx];
-    double upper = d_upperBounds[dimIdx];
+            curandState localState = rngStates[idx];
 
-    curandState localState = rngStates[idx];
+            int    neighborIdx = bestNeighborIdx[i];
+            double x_neighbor  = positions[neighborIdx * D + dimIdx];
+            double x_best      = positions[globalBestIdx * D + dimIdx];
+            double x_current   = positions[idx];
 
-    double r = curand_uniform_double(&localState);
-    if (r < delta) {
-        // Disturbance: reinitialise uniformly in bounds
-        double r2 = curand_uniform_double(&localState);
-        positions[idx] = lower + r2 * (upper - lower);
-    } else {
-        int    neighborIdx = bestNeighborIdx[i];
-        double x_neighbor  = positions_old[neighborIdx * D + dimIdx];
-        double x_best      = positions_old[globalBestIdx * D + dimIdx];
-        double x_current   = positions_old[idx];
+            double r = curand_uniform_double(&localState);
+            double x_new;
+            if (r < delta) {
+                double r2 = curand_uniform_double(&localState);
+                x_new = lower + r2 * (upper - lower);
+            } else {
+                double u = curand_uniform_double(&localState);
+                x_new = x_neighbor + u * (x_best - x_current);
+                if (x_new < lower || x_new > upper) {
+                    double r3 = curand_uniform_double(&localState);
+                    x_new = lower + r3 * (upper - lower);
+                }
+            }
 
-        double u     = curand_uniform_double(&localState);
-        double x_new = x_neighbor + u * (x_best - x_current);
-
-        if (x_new < lower || x_new > upper) {
-            double r3 = curand_uniform_double(&localState);
-            x_new = lower + r3 * (upper - lower);
+            rngStates[idx] = localState;
+            positions[idx] = x_new;
         }
-        positions[idx] = x_new;
+        __syncthreads();   // unconditional — all threads barrier here every iteration
     }
-
-    rngStates[idx] = localState;
 }
 
 //=============================================================================

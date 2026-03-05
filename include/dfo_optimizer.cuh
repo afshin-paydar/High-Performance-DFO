@@ -287,20 +287,14 @@ inline void DFOOptimizer::updatePopulation() {
     // copyStream_ must have finished delivering h_globalBestIdx_
     CUDA_CHECK(cudaStreamSynchronize(copyStream_));
 
-    // Snapshot current positions so the Jacobi kernels read from a consistent
-    // pre-update state while writing new positions to d_positions_.
-    CUDA_CHECK(cudaMemcpyAsync(d_positions_old_, d_positions_,
-                               (size_t)N * D * sizeof(double),
-                               cudaMemcpyDeviceToDevice, computeStream_));
-
     // Block size: smallest power-of-2 >= D, capped at 1024.
-    // Each of the N blocks handles one fly; blockDim.x covers all D dimensions.
+    // Gauss-Seidel uses a single block; D threads cover all dimensions of each fly.
     int blockSize = 1;
     while (blockSize < D && blockSize < 1024) blockSize <<= 1;
 
     if (config_.variant == DFOVariant::STANDARD) {
-        kernelUpdateDFO_Jacobi<<<N, blockSize, 0, computeStream_>>>(
-            d_positions_, d_positions_old_, d_bestNeighborIdx_, d_rngStates_,
+        kernelUpdateDFO_GaussSeidel<<<1, blockSize, 0, computeStream_>>>(
+            d_positions_, d_bestNeighborIdx_, d_rngStates_,
             h_globalBestIdx_, config_.delta, N, D);
     } else {
         kernelUpdateUDFO_Jacobi<<<N, blockSize, 0, computeStream_>>>(
@@ -447,7 +441,9 @@ inline DFOResult DFOOptimizer::optimize(FitnessFunction fitnessType) {
     CUDA_CHECK(cudaEventCreate(&stop));
     CUDA_CHECK(cudaEventRecord(start, computeStream_));
 
-    int printInterval = config_.maxIterations / 10;
+    int printInterval = (config_.printInterval > 0)
+                        ? config_.printInterval
+                        : config_.maxIterations / 10;
     if (printInterval == 0) printInterval = 1;
 
     for (int iter = 0; iter < config_.maxIterations; iter++) {
