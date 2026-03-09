@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 run_cec2017.py  —  CEC2017-style experimental protocol for DFO
 ===============================================================
@@ -162,9 +163,10 @@ def run_single(
     run: int,
     variant: str = "standard",
     verbose: bool = False,
+    n_population: int = N_POPULATION,
 ) -> dict[str, Any]:
     """Execute one DFO run and return parsed result dict."""
-    N    = N_POPULATION
+    N    = n_population
     T    = n_iterations(D, N)
     pi   = print_interval(T)
     seed = seed_for_run(run)
@@ -221,6 +223,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     dims      = sorted(args.dims)
     n_runs    = args.runs
     variant   = args.variant
+    n_pop     = args.population
     out_dir   = Path(args.output)
     raw_dir   = out_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -241,8 +244,8 @@ def run_experiment(args: argparse.Namespace) -> None:
     print(f"  Functions: {functions}")
     print(f"  Dims     : {dims}")
     print(f"  Runs/cell: {n_runs}")
-    print(f"  N (pop)  : {N_POPULATION}")
-    print(f"  Budget   : MaxFEs = 10,000 × D   (T = MaxFEs / {N_POPULATION})")
+    print(f"  N (pop)  : {n_pop}")
+    print(f"  Budget   : MaxFEs = 10,000 × D   (T = MaxFEs / {n_pop})")
     print(f"  Seeds    : {BASE_SEED} + run × {SEED_STRIDE}")
     print(f"  Output   : {out_dir}/")
     _sep()
@@ -251,14 +254,14 @@ def run_experiment(args: argparse.Namespace) -> None:
         all_results[func] = {}
         for D in dims:
             all_results[func][D] = []
-            T   = n_iterations(D, N_POPULATION)
+            T   = n_iterations(D, n_pop)
             fes = max_fes(D)
             print(f"\n[{func.upper():<12s}  D={D:3d}]  T={T:,}  MaxFEs={fes:,}")
 
             for run in range(n_runs):
                 rec = run_single(
                     binary, func, D, run,
-                    variant=variant, verbose=True
+                    variant=variant, verbose=True, n_population=n_pop
                 )
                 # Save individual run
                 raw_path = raw_dir / f"{func}_D{D:03d}_run{run:02d}.json"
@@ -336,7 +339,9 @@ def parse_cli() -> argparse.Namespace:
                    choices=["standard", "udfo1000", "udfo1500", "udfoz5"])
     p.add_argument("--functions", nargs="+", default=FUNCTIONS, choices=FUNCTIONS)
     p.add_argument("--dims",      nargs="+", type=int, default=DIMS)
-    p.add_argument("--runs",      type=int, default=N_RUNS)
+    p.add_argument("--runs",       type=int, default=N_RUNS)
+    p.add_argument("--population", type=int, default=N_POPULATION,
+                   help="Population size N (default: %(default)s)")
     p.add_argument("--output",    default="results")
     p.add_argument("--quick",     action="store_true",
                    help="D={10,30}, 5 runs — quick sanity check")

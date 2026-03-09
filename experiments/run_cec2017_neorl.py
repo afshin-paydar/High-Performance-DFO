@@ -97,6 +97,23 @@ def load_functions(indices: Optional[List[int]] = None) -> List[Tuple]:
     return out
 
 
+def supported_dims(candidate_dims: List[int]) -> List[int]:
+    """
+    Return only the dims from candidate_dims that neorl CEC2017 can handle.
+    neorl ships rotation matrices only for a fixed set of dimensions
+    (typically {2, 10, 20, 30, 50, 100}); any other D raises a KeyError.
+    """
+    func = functions.all_functions[0]
+    ok   = []
+    for D in candidate_dims:
+        try:
+            func(np.zeros(D))
+            ok.append(D)
+        except Exception:
+            pass
+    return ok
+
+
 def probe_dimension_independence(func_list: List[Tuple]) -> None:
     """
     Quick sanity-check: evaluate the first (up to 5) functions at D=10 and
@@ -256,7 +273,14 @@ def interp_checkpoints(
 # ── Experiment orchestrator ───────────────────────────────────────────────────
 
 def run_experiment(args: argparse.Namespace) -> None:
-    dims    = sorted(args.dims)
+    requested = sorted(args.dims)
+    dims      = supported_dims(requested)
+    skipped   = [d for d in requested if d not in dims]
+    if skipped:
+        print("[WARNING] neorl CEC2017 has no rotation matrices for D={} — skipping.".format(
+            skipped), file=sys.stderr)
+    if not dims:
+        sys.exit("[ERROR] No valid dimensions remain after filtering.")
     n_runs  = args.runs
     out_dir = Path(args.output)
     raw_dir = out_dir / "raw"

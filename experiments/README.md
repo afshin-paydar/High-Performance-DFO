@@ -32,6 +32,39 @@ python experiments/plot_results.py --input results/results.json --output figures
 
 ---
 
+## Alternative: Full CEC2017 suite via neorl
+
+`run_cec2017_neorl.py` runs DFO against all 29 CEC2017 functions (`f1`, `f3`, ..., `f30`)
+using the neorl benchmark library. It is a pure-NumPy DFO and does **not** use `dfo_gpu`.
+
+```bash
+pip install neorl
+
+# Full protocol: 29 functions × 4 dims × 30 runs
+python experiments/run_cec2017_neorl.py --output results_neorl/
+
+# Sanity check (f1/f3/f4, D={10,30}, 5 runs)
+python experiments/run_cec2017_neorl.py --quick
+
+# Custom dimensions and run count
+python experiments/run_cec2017_neorl.py --dims 10 30 50 100 --runs 10
+
+# Specific function indices
+python experiments/run_cec2017_neorl.py --func-indices 1 3 5 7 9
+```
+
+**Supported dimensions**: neorl ships rotation matrices only for `D ∈ {2, 10, 20, 30, 50, 100}`.
+Requesting any other dimension (e.g. 300, 500) will print a warning and skip that dimension.
+
+Note: this script does **not** accept `--variant` or `--functions`; it always runs
+standard DFO on all neorl CEC2017 functions (bounds fixed at `[-100, 100]^D`).
+
+```bash
+python experiments/plot_results.py --input results_neorl/results.json --output figures_neorl/
+```
+
+---
+
 ## Protocol details
 
 | Parameter | Value | Justification |
