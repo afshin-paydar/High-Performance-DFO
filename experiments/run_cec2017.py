@@ -164,10 +164,11 @@ def run_single(
     variant: str = "standard",
     verbose: bool = False,
     n_population: int = N_POPULATION,
+    iterations: int | None = None,
 ) -> dict[str, Any]:
     """Execute one DFO run and return parsed result dict."""
-    N    = n_population
-    T    = n_iterations(D, N)
+    N = n_population
+    T = iterations if iterations is not None else n_iterations(D, N)
     pi   = print_interval(T)
     seed = seed_for_run(run)
 
@@ -224,6 +225,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     n_runs    = args.runs
     variant   = args.variant
     n_pop     = args.population
+    fixed_T   = args.iterations   # None means derive from budget
     out_dir   = Path(args.output)
     raw_dir   = out_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -245,7 +247,10 @@ def run_experiment(args: argparse.Namespace) -> None:
     print(f"  Dims     : {dims}")
     print(f"  Runs/cell: {n_runs}")
     print(f"  N (pop)  : {n_pop}")
-    print(f"  Budget   : MaxFEs = 10,000 × D   (T = MaxFEs / {n_pop})")
+    if fixed_T is not None:
+        print(f"  Iterations: T = {fixed_T:,}  (fixed, overrides CEC2017 budget)")
+    else:
+        print(f"  Budget   : MaxFEs = 10,000 × D   (T = MaxFEs / {n_pop})")
     print(f"  Seeds    : {BASE_SEED} + run × {SEED_STRIDE}")
     print(f"  Output   : {out_dir}/")
     _sep()
@@ -254,14 +259,15 @@ def run_experiment(args: argparse.Namespace) -> None:
         all_results[func] = {}
         for D in dims:
             all_results[func][D] = []
-            T   = n_iterations(D, n_pop)
-            fes = max_fes(D)
+            T   = fixed_T if fixed_T is not None else n_iterations(D, n_pop)
+            fes = T * n_pop
             print(f"\n[{func.upper():<12s}  D={D:3d}]  T={T:,}  MaxFEs={fes:,}")
 
             for run in range(n_runs):
                 rec = run_single(
                     binary, func, D, run,
-                    variant=variant, verbose=True, n_population=n_pop
+                    variant=variant, verbose=True, n_population=n_pop,
+                    iterations=T,
                 )
                 # Save individual run
                 raw_path = raw_dir / f"{func}_D{D:03d}_run{run:02d}.json"
@@ -342,6 +348,8 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--runs",       type=int, default=N_RUNS)
     p.add_argument("--population", type=int, default=N_POPULATION,
                    help="Population size N (default: %(default)s)")
+    p.add_argument("--iterations", type=int, default=None,
+                   help="Fixed iteration count T (default: 10,000×D/N per CEC2017 budget)")
     p.add_argument("--output",    default="results")
     p.add_argument("--quick",     action="store_true",
                    help="D={10,30}, 5 runs — quick sanity check")
